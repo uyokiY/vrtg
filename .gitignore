@@ -1,11 +1,24 @@
 checkpoints/
 data/
 results/
-*.pkl
-*.npy
-checkpoints/
-results/
-data/
+plots/
+
+__pycache__/
+*.py[cod]
+.ipynb_checkpoints/
+
+.DS_Store
+.env
+.venv/
+venv/
+
 *.pkl
 *.npy
 *.csv
+
+# Office temp files
+~$*.xlsx
+
+# Accidentally generated SSH key files should never be committed
+eval "$(ssh-agent -s)"
+eval "$(ssh-agent -s)".pub

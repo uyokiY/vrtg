@@ -16,6 +16,123 @@ from matplotlib.ticker import MultipleLocator, FixedLocator
 from sklearn.metrics import confusion_matrix, roc_auc_score, precision_score, recall_score, f1_score
 from sklearn.preprocessing import StandardScaler
 
+
+DEFAULT_METADATA_PATH = "问题类型记录.xlsx"
+VALID_EXPERIMENT_TYPES = ["whole", "jump", "red", "jolt"]
+
+
+def normalize_csv_name(value):
+    value = str(value)
+    return value if value.endswith(".csv") else f"{value}.csv"
+
+
+def load_experiment_metadata(metadata_path=DEFAULT_METADATA_PATH):
+    metadata = pd.read_excel(metadata_path).copy()
+    metadata["csv_name"] = metadata["csv_name"].apply(normalize_csv_name)
+    return metadata[metadata["type"].isin(VALID_EXPERIMENT_TYPES)].copy()
+
+
+def read_flight_rows(data_folder, metadata, flight_ids):
+    selected = metadata[metadata["flight_id"].isin(flight_ids)].copy()
+    selected["flight_id"] = pd.Categorical(
+        selected["flight_id"],
+        categories=list(flight_ids),
+        ordered=True,
+    )
+    selected = selected.sort_values("flight_id")
+
+    all_data = []
+    for _, row in selected.iterrows():
+        flight_id = int(row["flight_id"])
+        filename = row["csv_name"]
+        file_path = os.path.join(data_folder, filename)
+        if not os.path.exists(file_path):
+            print(f"Warning: {file_path} not found, skipping...")
+            continue
+
+        print(f"Loading flight_id: {flight_id}, filename: {filename}")
+        flight_data = pd.read_csv(file_path, usecols=["status", "VRTG"])
+        flight_data["flight_id"] = flight_id
+        flight_data["index"] = flight_data.index
+        flight_data["csv_name"] = filename
+        flight_data["flight_type"] = row["type"]
+        flight_data["split_seq"] = row["split_seq"]
+        all_data.append(flight_data)
+
+    if not all_data:
+        return pd.DataFrame(
+            columns=["status", "VRTG", "flight_id", "index", "csv_name", "flight_type", "split_seq"]
+        )
+    return pd.concat(all_data, ignore_index=True)
+
+
+def load_bilstm_data(
+    data_folder,
+    metadata_path=DEFAULT_METADATA_PATH,
+    train_sample_ids=None,
+    val_sample_ids=None,
+):
+    """
+    Load the module-level BiLSTM split:
+    train/val focus on whole-vs-representative-normal learning, while test is
+    the hold-out multi-type split for final BiLSTM-only evaluation.
+    """
+    metadata = load_experiment_metadata(metadata_path)
+    train_sample_ids = [] if train_sample_ids is None else list(train_sample_ids)
+    val_sample_ids = [] if val_sample_ids is None else list(val_sample_ids)
+
+    train_whole_ids = metadata[
+        (metadata["type"] == "whole") & (metadata["split_seq"] == "train3")
+    ]["flight_id"].tolist()
+    train_normal_ids = metadata[
+        (metadata["status"] == "normal") & (metadata["flight_id"].isin(train_sample_ids))
+    ]["flight_id"].tolist()
+    val_whole_ids = metadata[
+        (metadata["type"] == "whole") & (metadata["split_seq"] == "val3")
+    ]["flight_id"].tolist()
+    val_normal_ids = metadata[
+        (metadata["status"] == "normal") & (metadata["flight_id"].isin(val_sample_ids))
+    ]["flight_id"].tolist()
+    test_ids = metadata[metadata["split_seq"] == "test"]["flight_id"].tolist()
+
+    train_ids = list(dict.fromkeys(train_whole_ids + train_normal_ids))
+    val_ids = list(dict.fromkeys(val_whole_ids + val_normal_ids))
+
+    print("BiLSTM train_flight_ids:", train_ids, "length:", len(train_ids))
+    print("BiLSTM val_flight_ids:", val_ids, "length:", len(val_ids))
+    print("Hold-out test_flight_ids:", test_ids, "length:", len(test_ids))
+
+    train_data = read_flight_rows(data_folder, metadata, train_ids)
+    val_data = read_flight_rows(data_folder, metadata, val_ids)
+    test_data = read_flight_rows(data_folder, metadata, test_ids)
+    print(f"Train size: {len(train_data)}, Val size: {len(val_data)}, Test size: {len(test_data)}")
+    return train_data, val_data, test_data
+
+
+def build_split_summary(split_frames):
+    rows = []
+    for split_name, data in split_frames.items():
+        if data.empty:
+            continue
+        group_cols = ["flight_id", "csv_name", "flight_type", "split_seq"]
+        for keys, flight_data in data.groupby(group_cols, sort=False):
+            flight_id, csv_name, flight_type, split_seq = keys
+            abnormal_points = int((flight_data["status"] == "abnormal").sum())
+            normal_points = int((flight_data["status"] == "normal").sum())
+            total_points = int(len(flight_data))
+            rows.append({
+                "split": split_name,
+                "flight_id": int(flight_id),
+                "csv_name": csv_name,
+                "flight_type": flight_type,
+                "split_seq": split_seq,
+                "normal_points": normal_points,
+                "abnormal_points": abnormal_points,
+                "total_points": total_points,
+                "abnormal_ratio": abnormal_points / total_points if total_points else 0.0,
+            })
+    return pd.DataFrame(rows)
+
 def load_data(data_folder, train_x, val_x):
     df = pd.read_excel('问题类型记录.xlsx')
     df['csv_name'] = df['csv_name'].apply(lambda x: str(x) + '.csv' if not str(x).endswith('.csv') else str(x))
@@ -239,14 +356,22 @@ class TimeSeriesDataset(Dataset):
         return len(self.X)
 
     def __getitem__(self, idx):
-        flight_id = str(self.flight_ids[idx])
+        flight_id = self.flight_ids[idx]
         index = self.indices[idx]
         # 计算窗口范围，但不能跨越航段
         start = idx
-        while start > 0 and self.flight_ids[start] == flight_id and (idx - start) < self.window_size:
+        while (
+            start > 0
+            and self.flight_ids[start - 1] == flight_id
+            and (idx - (start - 1)) <= self.window_size
+        ):
             start -= 1
         end = idx
-        while end < len(self.X) - 1 and self.flight_ids[end] == flight_id and (end - idx) < self.window_size:
+        while (
+            end < len(self.X) - 1
+            and self.flight_ids[end + 1] == flight_id
+            and ((end + 1) - idx) <= self.window_size
+        ):
             end += 1
         window_data = self.X[start:end + 1]
 
@@ -303,13 +428,45 @@ def compute_confusion_on_loader(model, loader, device):
     return confusion_matrix(all_labels, all_preds)
 
 
-def train(model, train_loader, epochs, start_epoch, device, optimizer, criterion, checkpoint_dir):
+@torch.no_grad()
+def evaluate_loader_metrics(model, loader, criterion, device):
+    model.eval()
+    total_loss = 0.0
+    total_samples = 0
+    all_preds = []
+    all_labels = []
+
+    for inputs, labels, _, _ in loader:
+        inputs, labels = inputs.to(device), labels.to(device)
+        outputs = model(inputs)
+        loss = criterion(outputs, labels)
+        predicted = outputs.argmax(dim=1)
+
+        total_loss += loss.item() * labels.size(0)
+        total_samples += labels.size(0)
+        all_preds.append(predicted.detach().cpu())
+        all_labels.append(labels.detach().cpu())
+
+    all_preds = torch.cat(all_preds).numpy()
+    all_labels = torch.cat(all_labels).numpy()
+    return {
+        "loss": total_loss / total_samples,
+        "accuracy": float((all_preds == all_labels).mean()),
+        "precision": precision_score(all_labels, all_preds, zero_division=0),
+        "recall": recall_score(all_labels, all_preds, zero_division=0),
+        "f1": f1_score(all_labels, all_preds, zero_division=0),
+        "confusion_matrix": confusion_matrix(all_labels, all_preds, labels=[0, 1]),
+    }
+
+
+def train(model, train_loader, epochs, start_epoch, device, optimizer, criterion, checkpoint_dir, val_loader=None):
     model.to(device)
-    best_train_acc = 0.0
+    best_score = -1.0
+    history = []
 
     for epoch in range(start_epoch, epochs):
         model.train()
-        running_loss = 0.0
+        total_loss = 0.0
         correct_preds = 0
         total_preds = 0
 
@@ -327,7 +484,7 @@ def train(model, train_loader, epochs, start_epoch, device, optimizer, criterion
             loss.backward()
             optimizer.step()
 
-            running_loss += loss.item()
+            total_loss += loss.item() * labels.size(0)
 
             _, predicted = torch.max(outputs, 1)
             correct_preds += (predicted == labels).sum().item()
@@ -337,23 +494,65 @@ def train(model, train_loader, epochs, start_epoch, device, optimizer, criterion
             all_preds.append(predicted.detach().cpu())
             all_labels.append(labels.detach().cpu())
 
-            train_loader_tqdm.set_postfix(loss=running_loss/len(train_loader), accuracy=correct_preds/total_preds)
+            train_loader_tqdm.set_postfix(loss=total_loss/total_preds, accuracy=correct_preds/total_preds)
 
-        # 计算训练集准确率
+        train_loss = total_loss / total_preds
         train_acc = correct_preds / total_preds
-        print(f"Loss: {running_loss/len(train_loader):.4f}, Training Accuracy: {train_acc:.4f}")
+        all_preds = torch.cat(all_preds).numpy()
+        all_labels = torch.cat(all_labels).numpy()
+        train_precision = precision_score(all_labels, all_preds, zero_division=0)
+        train_recall = recall_score(all_labels, all_preds, zero_division=0)
+        train_f1 = f1_score(all_labels, all_preds, zero_division=0)
+        print(
+            f"Loss: {train_loss:.4f}, Training Accuracy: {train_acc:.4f}, "
+            f"Precision: {train_precision:.4f}, Recall: {train_recall:.4f}, F1: {train_f1:.4f}"
+        )
 
-        cm_train = compute_confusion_on_loader(model, train_loader, device)
+        cm_train = confusion_matrix(all_labels, all_preds, labels=[0, 1])
         print(f"[Epoch {epoch+1}] Train CM (eval mode, final weights):\n{cm_train}")
 
-        # 保存检查点
-        checkpoint = {
-            "model_state_dict": model.state_dict(),
-            "optimizer_state_dict": optimizer.state_dict(),
-            "epoch": epoch + 1
+        row = {
+            "epoch": epoch + 1,
+            "train_loss": train_loss,
+            "train_accuracy": train_acc,
+            "train_precision": train_precision,
+            "train_recall": train_recall,
+            "train_f1": train_f1,
         }
-        torch.save(checkpoint, f"{checkpoint_dir}/best_checkpoint.pth")
-        print(f"Checkpoint saved at epoch {epoch+1}")
+
+        if val_loader is not None:
+            val_metrics = evaluate_loader_metrics(model, val_loader, criterion, device)
+            print(
+                f"[Epoch {epoch+1}] Val Loss: {val_metrics['loss']:.4f}, "
+                f"Accuracy: {val_metrics['accuracy']:.4f}, Precision: {val_metrics['precision']:.4f}, "
+                f"Recall: {val_metrics['recall']:.4f}, F1: {val_metrics['f1']:.4f}"
+            )
+            print(f"[Epoch {epoch+1}] Val CM:\n{val_metrics['confusion_matrix']}")
+            row.update({
+                "val_loss": val_metrics["loss"],
+                "val_accuracy": val_metrics["accuracy"],
+                "val_precision": val_metrics["precision"],
+                "val_recall": val_metrics["recall"],
+                "val_f1": val_metrics["f1"],
+            })
+            score = val_metrics["f1"]
+        else:
+            score = train_f1
+
+        history.append(row)
+        if score >= best_score:
+            best_score = score
+            checkpoint = {
+                "model_state_dict": model.state_dict(),
+                "optimizer_state_dict": optimizer.state_dict(),
+                "epoch": epoch + 1,
+                "best_score": best_score,
+                "best_score_name": "val_f1" if val_loader is not None else "train_f1",
+            }
+            torch.save(checkpoint, f"{checkpoint_dir}/best_checkpoint.pth")
+            print(f"Best checkpoint saved at epoch {epoch+1} ({checkpoint['best_score_name']}={best_score:.4f})")
+
+    return history
 
 
 
@@ -535,4 +734,3 @@ class FocalLoss(nn.Module):
         p_t = torch.exp(-ce_loss)  # 计算正确分类的概率
         focal_loss = self.alpha * (1 - p_t) ** self.gamma * ce_loss  # 增强难分类样本的损失
         return focal_loss.mean()
-

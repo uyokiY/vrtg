@@ -1,0 +1,11 @@
+--index-url https://download.pytorch.org/whl/cpu
+--extra-index-url https://pypi.org/simple
+
+torch==2.11.0+cpu
+pandas==3.0.2
+numpy==2.4.4
+scikit-learn==1.8.0
+matplotlib==3.10.8
+seaborn==0.13.2
+tqdm==4.67.3
+openpyxl==3.1.5

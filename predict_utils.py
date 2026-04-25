@@ -43,8 +43,9 @@ def test_single_flight(test_data, flight_id, features, scaler):
     # 获取flight_id和索引信息
     flight_ids = flight_data['flight_id'].values
     indices = flight_data['index'].values
-    
-    return X_flight, y_flight, flight_ids, indices
+    raw_vrtg = flight_data['VRTG'].values
+
+    return X_flight, y_flight, flight_ids, indices, raw_vrtg
 
 
 def evaluate_flight(model, data_loader, device, flight_id):
@@ -106,20 +107,18 @@ def evaluate_flight(model, data_loader, device, flight_id):
     }
 
 
-def plot_miscls_points(mismatches, X_flight, y_flight, flight_id, plot_save_dir):
+def plot_miscls_points(mismatches, raw_vrtg, y_flight, flight_id, plot_save_dir):
     """
     绘制某航班的VRTG时间序列图，并标出模型预测错误的位置。
 
     参数：
     - mismatches: list[int]，预测错误的点的局部索引（针对该航班）
-    - X_flight: np.ndarray，形状为 (T, D)，D 维特征，其中第一列是 VRTG
+    - raw_vrtg: np.ndarray，形状为 (T,)，原始 VRTG 序列
     - y_flight: np.ndarray，形状为 (T,)，对应每个时间点的真实标签
     - flight_id: str 或 int，航班标识
     - plot_save_dir: str，图像保存路径
     """
-
-    vrtg_values = X_flight[:, 0]  # 假设第0列是 VRTG
-    time_steps = np.arange(len(vrtg_values))
+    vrtg_values = raw_vrtg
 
     # 分类
     normal_idx = np.where(y_flight == 0)[0]
@@ -144,50 +143,59 @@ def plot_miscls_points(mismatches, X_flight, y_flight, flight_id, plot_save_dir)
     save_path = os.path.join(plot_save_dir, f"flight_{flight_id}_misclassified.png")
     plt.savefig(save_path, dpi=300)
     print(f"图像已保存到: {save_path}")
+    plt.close()
 
-    plt.show()
-
-
-def test_model_on_flight(model, batch_size, model_path, test_data, flight_id, features, scaler, window_size, device, plot_save_dir):
-    """
-    单个航班测试流程
-    """
-    # 1. 加载模型
+def load_checkpoint_into_model(model, model_path, device):
     print(f"** 加载模型从 {model_path}")
     checkpoint = torch.load(model_path, map_location=device)
     model.load_state_dict(checkpoint["model_state_dict"])
     model = model.to(device)
     model.eval()
-
     print(f"模型已加载，使用设备: {device}")
+    return model
 
-    # 2. 准备数据
+
+def test_model_on_flight(model, batch_size, test_data, flight_id, features, scaler, window_size, device, plot_save_dir):
+    """
+    单个航班测试流程
+    """
+
     flight_test_data = test_single_flight(test_data, flight_id, features, scaler)
     
     if not flight_test_data:
         return None
     
-    X_flight, y_flight, flight_ids, indices = flight_test_data
+    X_flight, y_flight, flight_ids, indices, raw_vrtg = flight_test_data
     
-    # 3. 创建数据加载器
     flight_dataset = TimeSeriesDataset(X_flight, y_flight, flight_ids, indices, window_size)
     flight_loader = torch.utils.data.DataLoader(flight_dataset, batch_size=batch_size, shuffle=False)
     print(f"准备测试数据完成，共 {len(flight_dataset)} 个样本")
 
-    # 4. 评估
     results = evaluate_flight(model, flight_loader, device, flight_id)
 
-    # 可视化
-    plot_miscls_points(np.where(results['predictions'] != results['labels'])[0],
-                       X_flight,
-                       y_flight,
-                       flight_id, 
-                       plot_save_dir)
+    plot_miscls_points(
+        np.where(results['predictions'] != results['labels'])[0],
+        raw_vrtg,
+        y_flight,
+        flight_id,
+        plot_save_dir,
+    )
     return results
 
 
 def aggregate_metrics(results_dict):
     """汇总多个航段的预测结果，计算总体metrics"""
+    if not results_dict:
+        return {
+            'confusion_matrix': np.zeros((2, 2), dtype=int),
+            'metrics': {
+                'accuracy': float('nan'),
+                'precision': float('nan'),
+                'recall': float('nan'),
+                'f1': float('nan')
+            }
+        }
+
     all_preds = []
     all_labels = []
     all_probs = []
