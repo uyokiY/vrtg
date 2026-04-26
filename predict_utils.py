@@ -147,7 +147,9 @@ def plot_miscls_points(mismatches, raw_vrtg, y_flight, flight_id, plot_save_dir)
 
 def load_checkpoint_into_model(model, model_path, device):
     print(f"** 加载模型从 {model_path}")
-    checkpoint = torch.load(model_path, map_location=device)
+    # PyTorch 2.6+ defaults to weights_only=True. Our trusted local checkpoint
+    # also stores optimizer state and scalar metadata, so load the full object.
+    checkpoint = torch.load(model_path, map_location=device, weights_only=False)
     model.load_state_dict(checkpoint["model_state_dict"])
     model = model.to(device)
     model.eval()

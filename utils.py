@@ -32,6 +32,18 @@ def load_experiment_metadata(metadata_path=DEFAULT_METADATA_PATH):
     return metadata[metadata["type"].isin(VALID_EXPERIMENT_TYPES)].copy()
 
 
+def clean_flight_data(flight_data, source_name=None):
+    flight_data = flight_data.copy()
+    flight_data["VRTG"] = pd.to_numeric(flight_data["VRTG"], errors="coerce")
+    invalid_count = int(flight_data["VRTG"].isna().sum())
+    if invalid_count:
+        source_text = f" in {source_name}" if source_name else ""
+        print(f"Warning: dropped {invalid_count} rows with non-numeric VRTG{source_text}")
+        flight_data = flight_data.dropna(subset=["VRTG"]).copy()
+    flight_data.reset_index(drop=True, inplace=True)
+    return flight_data
+
+
 def read_flight_rows(data_folder, metadata, flight_ids):
     selected = metadata[metadata["flight_id"].isin(flight_ids)].copy()
     selected["flight_id"] = pd.Categorical(
@@ -52,6 +64,7 @@ def read_flight_rows(data_folder, metadata, flight_ids):
 
         print(f"Loading flight_id: {flight_id}, filename: {filename}")
         flight_data = pd.read_csv(file_path, usecols=["status", "VRTG"])
+        flight_data = clean_flight_data(flight_data, filename)
         flight_data["flight_id"] = flight_id
         flight_data["index"] = flight_data.index
         flight_data["csv_name"] = filename
@@ -159,6 +172,7 @@ def load_data(data_folder, train_x, val_x):
             continue
         print(f"Loading flight_id: {flight_id}, filename: {filename}")
         df = pd.read_csv(file_path, usecols=['status', 'VRTG'])
+        df = clean_flight_data(df, filename)
         df['flight_id'] = flight_id
         df['index'] = df.index  # 记录在该航段中的原始索引，从 0 开始
         all_data.append(df)
@@ -200,6 +214,7 @@ def load_whole_data(data_folder, train_x='train3', sample_ids=[29,30,32,40,46,47
             continue
         print(f"Loading flight_id: {flight_id}, filename: {filename}")
         df = pd.read_csv(file_path, usecols=['status', 'VRTG'])
+        df = clean_flight_data(df, filename)
         df['flight_id'] = flight_id
         df['index'] = df.index  # 记录在该航段中的原始索引，从 0 开始
         all_data.append(df)
@@ -241,6 +256,7 @@ def load_VAE_data(data_folder):
             print(f"Warning: {file_path} not found, skipping...")
             continue
         df = pd.read_csv(file_path, usecols=['status', 'VRTG'])
+        df = clean_flight_data(df, filename)
         df['flight_id'] = flight_id
         df['index'] = df.index  # 记录在该航段中的原始索引，从 0 开始
         all_data.append(df)
@@ -260,6 +276,13 @@ def compute_features(df, rolling_window_size):
     flight_ids = df['flight_id'].unique()  # 通过航段 ID 分组，逐个计算特征
     for flight_id in flight_ids:  # 避免跨航段
         flight_data = df[df['flight_id'] == flight_id].copy()
+        flight_data['VRTG'] = pd.to_numeric(flight_data['VRTG'], errors='coerce')
+        invalid_count = int(flight_data['VRTG'].isna().sum())
+        if invalid_count:
+            print(f"Warning: dropped {invalid_count} rows with non-numeric VRTG for flight_id {flight_id}")
+            flight_data = flight_data.dropna(subset=['VRTG']).copy()
+        if flight_data.empty:
+            continue
         # 一阶、二阶差分
         flight_data['VRTG_diff1'] = flight_data['VRTG'].diff().fillna(0)
         # flight_data['VRTG_diff2'] = flight_data['VRTG'].diff(2).fillna(0)
@@ -287,6 +310,8 @@ def compute_features(df, rolling_window_size):
         flight_data['VRTG_robust_z'] = 0.6745 * (flight_data['VRTG'] - median) / (mad + eps)
         processed_data.append(flight_data)
         
+    if not processed_data:
+        return pd.DataFrame(columns=df.columns)
     return pd.concat(processed_data, ignore_index=True)
 
 
@@ -296,6 +321,13 @@ def compute_features_v2(df, rolling_window_size):
 
     for flight_id in flight_ids:  # 避免跨航段
         flight_data = df[df['flight_id'] == flight_id].copy()
+        flight_data['VRTG'] = pd.to_numeric(flight_data['VRTG'], errors='coerce')
+        invalid_count = int(flight_data['VRTG'].isna().sum())
+        if invalid_count:
+            print(f"Warning: dropped {invalid_count} rows with non-numeric VRTG for flight_id {flight_id}")
+            flight_data = flight_data.dropna(subset=['VRTG']).copy()
+        if flight_data.empty:
+            continue
 
         # 1. 一阶/n阶差分（ΔVRTG_t）
         flight_data['VRTG_diff_1'] = flight_data['VRTG'].diff().fillna(0)
@@ -333,6 +365,8 @@ def compute_features_v2(df, rolling_window_size):
 
 
 
+    if not processed_data:
+        return pd.DataFrame(columns=df.columns)
     return pd.concat(processed_data, ignore_index=True)
 
 
